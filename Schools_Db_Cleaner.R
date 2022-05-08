@@ -1,54 +1,53 @@
 start_time <- Sys.time()
 # Libraries ---------------------------------------------------------------
-lapply(as.list(c("tidyverse","janitor","readxl",
-                 "writexl")),require,character.only=TRUE)
-# All_Excel_Reader --------------------------------------------------------
-all_excel <- function(path){
-  collect_sheets <- excel_sheets(path)
-  number_of_sheets <- 1:length(collect_sheets)
-  per_sheet <- list()
-  for(i in seq_along(number_of_sheets)){
-    per_sheet[[i]] <- read_xlsx(path = path,
-                                sheet = collect_sheets[i])
-  }
-  return(per_sheet)}
+source("./All_Functions.R",
+       local = knitr::knit_global())
+sivu_is_a_lib()
+doParallel::registerDoParallel(cores = 10)
 # All_Masterlist ----------------------------------------------------------
 EDU_Dbs <- data.frame(master_list = list.files(path = "./Schools_Db",
            full.names=TRUE,
-           pattern = ".xlsx")) %>% 
-  mutate(schools_db = map(master_list,all_excel))
+           pattern = ".xlsx"))
 
 EDU_Dbs <- EDU_Dbs %>% 
-  unnest(schools_db)
-
-EDU_Dbs$schools_db <- lapply(EDU_Dbs$schools_db,sapply,as.character)
-
-EDU_Dbs$schools_db <- lapply(EDU_Dbs$schools_db,as.data.frame)
+  mutate(sheet_names = map(master_list,excel_sheets))
 
 EDU_Dbs <- EDU_Dbs %>% 
-  unnest(schools_db)
+  unnest(sheet_names)
+# Custom Excel ------------------------------------------------------------
 
-EDU_Dbs <- EDU_Dbs %>% 
+extract_excel <- function(a_df,sheets,paths){
+  number_of_rows <- 1:nrow(a_df)
+  a_df <- data.frame(a_df)
+  all_files <- list()
+  try(
+  for(i in seq_along(number_of_rows)){
+    all_files[[i]] <- read_xlsx(path = a_df[i,paste0(paths)],
+                                sheet = a_df[i,paste0(sheets)])
+    })
+  return(all_files)
+}
+
+Dbs <- extract_excel(a_df = EDU_Dbs,
+                     sheets = "sheet_names",
+                     paths = "master_list")
+
+
+Dbs <- lapply(Dbs,sapply,as.character)
+Dbs <- lapply(Dbs,as.data.frame)
+
+Dbs <- do.call(bind_rows,Dbs)
+
+Dbs <- Dbs %>% 
   clean_names()
-EDU_Dbs <- EDU_Dbs %>% 
-  select(contains("emis"),
-         contains("data"),
-         contains("province"),
-         contains("exam_centre"),
-         contains("exam_no"),
-         contains("institution_name"),
-         contains("municipality"),
-         contains("muni"),
-         contains("ward"),
-         contains("address"),
-         contains("quintile"),
-         contains("long"),
-         contains("lat"))
 
-EDU_Dbs <- EDU_Dbs %>% 
+Dbs <- Dbs[,grep("emis|data|province|exam_centre|exam_no|institution_name|municipality|muni|ward|address|quintile|long|lat|learners|educators",
+              colnames(Dbs))]
+
+Dbs <- Dbs %>% 
   unique()
 # Clean EMIS Number -------------------------------------------------------
-EDU_Dbs <- EDU_Dbs %>% 
+Dbs <- Dbs %>% 
   mutate(datayear = ifelse(is.na(datayear)==TRUE,
                            data_year,
                            datayear)) %>% 
@@ -75,12 +74,12 @@ EDU_Dbs <- EDU_Dbs %>%
             nat_emis_2,nat_emis)) %>% 
   unique()
 # Clean_Exams --------------------------------------------------
-EDU_Dbs <- EDU_Dbs %>% 
+Dbs <- Dbs %>% 
   filter(!is.na(exam_no),
          exam_no != "N/A",
          !is.na(exam_centre))
 # Clean_Institution_Name ----------------------------------------------------
-EDU_Dbs <- EDU_Dbs %>% 
+Dbs <- Dbs %>% 
   mutate(institution_name = ifelse(is.na(institution_name)==TRUE,
                                    institution_name_2,
                                    institution_name),
@@ -89,13 +88,36 @@ EDU_Dbs <- EDU_Dbs %>%
                                    institution_name)) %>% 
   select(!contains("institution_name_2"),
          -official_institution_name)
+# Clean_Learners and Educators --------------------------------------------
+Dbs <- Dbs %>% 
+  pivot_longer(contains("learners"),
+               names_to = "learners",
+               values_to = "learner_number") %>% 
+  filter(!is.na(learner_number)) %>%
+  mutate(learners = "learners") %>% 
+  unique() %>% 
+  pivot_wider(names_from = learners,
+              values_from = learner_number) %>% 
+  unnest(learners)
+
+Dbs <- Dbs %>% 
+  pivot_longer(contains("educators"),
+               names_to = "educators",
+               values_to = "educator_number") %>% 
+  filter(!is.na(educator_number)) %>% 
+  mutate(educators = "educators") %>% 
+  unique() %>% 
+  pivot_wider(names_from = educators,
+              values_from = educator_number) %>% 
+  unnest(educators)
+
 # Clean Further -----------------------------------------------------------
-EDU_Dbs <- EDU_Dbs[,c("new_natemis","exam_centre","institution_name","exam_no",
+Dbs <- Dbs[,c("new_natemis","exam_centre","institution_name","exam_no",
            "quintile","ward_id","street_address",
            "new_long","gis_longitude","gis_long","longitude",
-           "new_lat","gis_lat","latitude")]
+           "new_lat","gis_lat","latitude","learners","educators")]
 
-EDU_Dbs <- EDU_Dbs %>% 
+Dbs <- Dbs %>% 
   mutate(new_long = ifelse(is.na(new_long)==TRUE,
                            gis_longitude,
                            new_long),
@@ -118,19 +140,28 @@ EDU_Dbs <- EDU_Dbs %>%
   unique()
 
 
-EDU_Dbs <- EDU_Dbs %>% 
+Dbs <- Dbs %>% 
   rename(emisno =new_natemis,
          centername=exam_centre,
          centreno = exam_no)
 
+Dbs <- Dbs[,!grepl("long|lat",names(Dbs))]
+
 dir.create("Clean_Db")
 
-write_csv(EDU_Dbs,
-          file = paste0("./Clean_Db/Clean_Db_Schools_",Sys.Date(),".csv"))
+
+arrow::write_parquet(Dbs,
+                     paste0("./Clean_Db/Clean_Db_Schools_",Sys.Date(),".parquet"))
 
 end_time <- Sys.time()
+
+list.files(full.names=TRUE,pattern = ".parquet",recursive = TRUE)
 
 print(difftime(time1 = end_time,
                time2= start_time,
                units = "mins"))
+
+list.files(full.names=TRUE,pattern = ".parquet",recursive = TRUE)
+
+
 rm(list= ls())
